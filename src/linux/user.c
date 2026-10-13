@@ -120,7 +120,7 @@ linux_evfilt_user_knote_create(struct filter *filt, struct knote *kn)
     int evfd;
 
     /* Create an eventfd */
-    evfd = eventfd(0, 0);
+    evfd = eventfd(0, EFD_CLOEXEC);
     if (evfd < 0) {
         dbg_perror("eventfd");
         goto errout;

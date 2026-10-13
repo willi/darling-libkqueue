@@ -200,7 +200,7 @@ evfilt_timer_knote_create(struct filter *filt, struct knote *kn)
 
     kn->kev.flags |= EV_CLEAR;
 
-    tfd = timerfd_create(LINUX_CLOCK_MONOTONIC, 0);
+    tfd = timerfd_create(LINUX_CLOCK_MONOTONIC, TFD_CLOEXEC);
     if (tfd < 0) {
         dbg_printf("timerfd_create(2): %s", strerror(errno));
         return (-1);

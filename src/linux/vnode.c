@@ -111,7 +111,7 @@ add_watch(struct filter *filt, struct knote *kn)
         mask |= IN_ONESHOT;
 
     /* Create an inotify descriptor */
-    ifd = inotify_init();
+    ifd = inotify_init1(IN_CLOEXEC);
     if (ifd < 0) {
         dbg_perror("inotify_init(2)");
         return (-1);
