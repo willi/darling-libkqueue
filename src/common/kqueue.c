@@ -296,12 +296,11 @@ kqueue_dup(int oldfd, int newfd)
 
 static void _kqueue_close_atfork_cb(int kqfd, void* kqptr, void* private)
 {
-	struct kqueue* kq = (struct kqueue*) kqptr;
-
-    // Mutexes are not valid after a fork, reset it to unlocked state
-    tracing_mutex_init(&kq->kq_mtx, NULL);
-
-    kqueue_delref(kq);
+    // A fork's child doesn't inherit kqueues. Their objects are leaked rather than freed: the child calls this
+    // before malloc is usable again (Darling's libsystem_kernel calls it from fork() itself), so this must not
+    // allocate or free memory. The descriptors their knotes use are close-on-exec.
+    (void) __close_for_kqueue(kqfd);
+    map_delete(kqmap, kqfd);
 }
 
 void VISIBLE kqueue_atfork(void)

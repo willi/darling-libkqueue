@@ -53,7 +53,7 @@ static void tls_setup(void)
 int
 linux_kqueue_init(struct kqueue *kq)
 {
-    kq->kq_id = epoll_create(1);
+    kq->kq_id = epoll_create1(EPOLL_CLOEXEC);
     if (kq->kq_id < 0) {
         dbg_perror("epoll_create(2)");
         return (-1);
@@ -254,7 +254,7 @@ linux_eventfd_init(struct eventfd *e)
 {
     int evfd;
 
-    evfd = eventfd(0, 0);
+    evfd = eventfd(0, EFD_CLOEXEC);
     if (evfd < 0) {
         dbg_perror("eventfd");
         return (-1);
