@@ -177,14 +177,19 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
         kn->kev.flags |= EV_DISABLE;
         rv = filt->kn_disable(filt, kn);
         dbg_printf("kn_disable returned %d", rv);
-    } else if (src->flags & EV_ENABLE) {
-        kn->kev.flags &= ~EV_DISABLE;
-        rv = filt->kn_enable(filt, kn);
-        dbg_printf("kn_enable returned %d", rv);
-    } else if (src->flags & EV_ADD || src->flags == 0 || src->flags & EV_RECEIPT) {
-        kn->kev.udata = src->udata;
-        rv = filt->kn_modify(filt, kn, src);
-        dbg_printf("kn_modify returned %d", rv);
+    } else {
+        if (src->flags & EV_ENABLE) {
+            kn->kev.flags &= ~EV_DISABLE;
+            rv = filt->kn_enable(filt, kn);
+            dbg_printf("kn_enable returned %d", rv);
+        }
+        // EV_ADD with EV_ENABLE updates the knote too, as XNU does (and libkqueue upstream): libdispatch re-arms its
+        // timers with EV_ADD | EV_ENABLE and a new deadline, which enabling alone would ignore
+        if (rv == 0 && (src->flags & EV_ADD || src->flags == 0 || src->flags & EV_RECEIPT)) {
+            kn->kev.udata = src->udata;
+            rv = filt->kn_modify(filt, kn, src);
+            dbg_printf("kn_modify returned %d", rv);
+        }
     }
 
     return (rv);
