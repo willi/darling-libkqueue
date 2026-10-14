@@ -210,6 +210,8 @@ kqueue_closed_fd(int fd)
 	if (kqmap == NULL)
 		return;
 
+	// close() succeeded, which leaves errno alone; the deletions below set it for each kqueue the fd isn't in
+	int saved_errno = errno;
 	struct kevent64_s ev[2];
 
 	ev[0].ident = fd;
@@ -266,6 +268,8 @@ kqueue_closed_fd(int fd)
 #ifdef DARLING
     __darling_kqueue_unregister_listen(fd);
 #endif
+
+	errno = saved_errno;
 }
 
 // FIXME: this can race with someone closing the old FD right after it's dup'ed but before we're informed.
