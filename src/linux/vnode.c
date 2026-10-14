@@ -251,9 +251,8 @@ evfilt_vnode_knote_modify(struct filter *filt, struct knote *kn,
         const struct kevent64_s *kev)
 {
     (void)filt;
-    (void)kn;
-    (void)kev;
-    return (-1); /* FIXME - STUB */
+    /* FIXME - STUB: only a re-registration that changes nothing succeeds */
+    return (kev->fflags == kn->kev.fflags) ? 0 : -1;
 }
 
 int

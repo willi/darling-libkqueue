@@ -178,13 +178,15 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
         rv = filt->kn_disable(filt, kn);
         dbg_printf("kn_disable returned %d", rv);
     } else {
+        // No check that the knote is disabled, unlike upstream: some knotes still look enabled when only EV_ENABLE
+        // re-arms them. With the check, launchd_sim never reaped its children (their exits never reached it).
         if (src->flags & EV_ENABLE) {
             kn->kev.flags &= ~EV_DISABLE;
             rv = filt->kn_enable(filt, kn);
             dbg_printf("kn_enable returned %d", rv);
         }
-        // EV_ADD with EV_ENABLE updates the knote too, as XNU does (and libkqueue upstream): libdispatch re-arms its
-        // timers with EV_ADD | EV_ENABLE and a new deadline, which enabling alone would ignore
+        // EV_ADD with EV_ENABLE updates the knote too, as XNU does (and libkqueue upstream, in kevent_copyin_one()):
+        // libdispatch re-arms its timers with EV_ADD | EV_ENABLE and a new deadline, which enabling alone would ignore
         if (rv == 0 && (src->flags & EV_ADD || src->flags == 0 || src->flags & EV_RECEIPT)) {
             kn->kev.udata = src->udata;
             rv = filt->kn_modify(filt, kn, src);
