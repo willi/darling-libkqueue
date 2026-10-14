@@ -16,6 +16,11 @@
 
 #include "private.h"
 
+#ifdef DARLING
+#include <sys/eventfd.h>
+#include <darling/emulation/linux_premigration/ext/for-libkqueue.h>
+#endif
+
 #if HAVE_SYS_SIGNALFD_H
 # include <sys/signalfd.h>
 #else
@@ -43,6 +48,7 @@ struct signalfd_siginfo
 };
 #endif
 
+#ifndef DARLING
 static void
 signalfd_reset(int sigfd)
 {
@@ -59,6 +65,8 @@ signalfd_reset(int sigfd)
         abort();
     }
 }
+
+#endif /* !DARLING */
 
 static int
 signalfd_add(int epfd, int sigfd, void *ptr)
@@ -79,6 +87,7 @@ signalfd_add(int epfd, int sigfd, void *ptr)
     return (0);
 }
 
+#ifndef DARLING
 static int
 signalfd_create(int epfd, void *ptr, int signum)
 {
@@ -121,7 +130,50 @@ errout:
     (void) __close_for_kqueue(sigfd);
     return (-1);
 }
+#endif /* !DARLING */
 
+#ifdef DARLING
+/*
+ * Darling's processes don't block signals on every thread, which a signalfd needs, and XNU records signals whatever
+ * their disposition anyway. Instead, each knote has an eventfd from Darling, which its signal handlers add 1 to
+ * whenever they deliver the signal (see signal_knotes.h in Darling's emulation). Only Darling closes it.
+ */
+static int
+signal_eventfd_create(int epfd, void *ptr, int signum)
+{
+    int fd;
+
+    fd = _signal_knote_open_4libkqueue(signum);
+    if (fd < 0) {
+        errno = -fd;
+        dbg_perror("_signal_knote_open_4libkqueue");
+        return (-1);
+    }
+    if (signalfd_add(epfd, fd, ptr) < 0) {
+        _signal_knote_close_4libkqueue(fd);
+        return (-1);
+    }
+    return (fd);
+}
+
+int
+evfilt_signal_copyout(struct kevent64_s *dst, struct knote *src, void *x UNUSED)
+{
+    eventfd_t count = 0;
+
+    kevent_int_to_64(&src->kev, dst);
+    /* the number of times the signal was delivered since the knote last fired, as XNU reports */
+    if (eventfd_read(src->kdata.kn_signalfd, &count) < 0 || count == 0) {
+        /* another thread's kevent() read it first */
+        dst->filter = EVFILT_DROP;
+        return (0);
+    }
+    dst->data = count;
+
+    return (0);
+}
+
+#else /* !DARLING */
 int
 evfilt_signal_copyout(struct kevent64_s *dst, struct knote *src, void *x UNUSED)
 {
@@ -139,13 +191,18 @@ evfilt_signal_copyout(struct kevent64_s *dst, struct knote *src, void *x UNUSED)
 
     return (0);
 }
+#endif /* DARLING */
 
 int
 evfilt_signal_knote_create(struct filter *filt, struct knote *kn)
 {
     int fd;
 
+#ifdef DARLING
+    fd = signal_eventfd_create(filter_epfd(filt), kn, kn->kev.ident);
+#else
     fd = signalfd_create(filter_epfd(filt), kn, kn->kev.ident);
+#endif
     if (fd > 0) {
         kn->kev.flags |= EV_CLEAR;
         kn->kdata.kn_signalfd = fd;
@@ -176,14 +233,24 @@ evfilt_signal_knote_delete(struct filter *filt, struct knote *kn)
         return (0);
 
     if (epoll_ctl(filter_epfd(filt), EPOLL_CTL_DEL, sigfd, NULL) < 0) {
-        dbg_perror("epoll_ctl(2)");
-        return (-1);
+#ifdef DARLING
+        /* a disabled knote's eventfd is already out of the epoll set */
+        if (errno != ENOENT)
+#endif
+        {
+            dbg_perror("epoll_ctl(2)");
+            return (-1);
+        }
     }
 
+#ifdef DARLING
+    _signal_knote_close_4libkqueue(sigfd);
+#else
     if (__close_for_kqueue(sigfd) < 0) {
         dbg_perror("close(2)");
         return (-1);
     }
+#endif
 
     /* NOTE: This does not call sigprocmask(3) to unblock the signal. */
     kn->kdata.kn_signalfd = -1;
@@ -191,6 +258,29 @@ evfilt_signal_knote_delete(struct filter *filt, struct knote *kn)
     return (0);
 }
 
+#ifdef DARLING
+/*
+ * A disabled knote keeps counting the signal, as XNU's does, and fires once enabled again if it arrived meanwhile:
+ * libdispatch disables a signal source's knote while its handler runs (EV_DISPATCH).
+ */
+int
+evfilt_signal_knote_enable(struct filter *filt, struct knote *kn)
+{
+    dbg_printf("enabling ident %u", (unsigned int) kn->kev.ident);
+    return signalfd_add(filter_epfd(filt), kn->kdata.kn_signalfd, kn);
+}
+
+int
+evfilt_signal_knote_disable(struct filter *filt, struct knote *kn)
+{
+    dbg_printf("disabling ident %u", (unsigned int) kn->kev.ident);
+    if (epoll_ctl(filter_epfd(filt), EPOLL_CTL_DEL, kn->kdata.kn_signalfd, NULL) < 0) {
+        dbg_perror("epoll_ctl(2)");
+        return (-1);
+    }
+    return (0);
+}
+#else
 int
 evfilt_signal_knote_enable(struct filter *filt, struct knote *kn)
 {
@@ -204,6 +294,7 @@ evfilt_signal_knote_disable(struct filter *filt, struct knote *kn)
     dbg_printf("disabling ident %u", (unsigned int) kn->kev.ident);
     return evfilt_signal_knote_delete(filt, kn);
 }
+#endif
 
 
 const struct filter evfilt_signal = {
