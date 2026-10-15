@@ -46,8 +46,14 @@ evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     epoll_event_dump(ev);
     kevent_int_to_64(&src->kev, dst);
 
-	// first, read the notification
-	rv = recv(src->kdata.kn_dupfd, &notification, sizeof(notification), 0);
+	// first, read the notification. epoll_wait() runs without the kqueue lock, so by now another thread may have taken
+	// it: a knote modify skips it (darlingserver sends a new one for messages still queued), or a second waiter got
+	// the same level-triggered event. Waiting for it would hold the kqueue lock forever; drop the event instead.
+	rv = recv(src->kdata.kn_dupfd, &notification, sizeof(notification), MSG_DONTWAIT);
+	if (rv < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+		dst->filter = EVFILT_DROP;
+		return 0;
+	}
 	if (rv < 0) {
 		dbg_printf("evfilt_machport_copyout() reading notification failed: %d (%s)", errno, strerror(errno));
 		return -1;
@@ -160,11 +166,15 @@ evfilt_machport_knote_modify(struct filter *filt, struct knote *kn,
 		return -1;
 	}
 
-	rv = recv(kn->kdata.kn_dupfd, &reply, sizeof(reply), 0);
-	if (rv < 0) {
-		dbg_printf("evfilt_machport_knote_modify recv failed: %d (%s)", errno, strerror(errno));
-		return -1;
-	}
+	// a notification darlingserver sent before it got the request comes first: skip it, as darlingserver sends one
+	// anew after the reply if there still is an event
+	do {
+		rv = recv(kn->kdata.kn_dupfd, &reply, sizeof(reply), 0);
+		if (rv < 0) {
+			dbg_printf("evfilt_machport_knote_modify recv failed: %d (%s)", errno, strerror(errno));
+			return -1;
+		}
+	} while (reply.header.number == dserver_kqchan_msgnum_notification);
 
 	if (reply.header.number != dserver_kqchan_msgnum_mach_port_modify) {
 		dbg_puts("evfilt_machport_knote_modify invalid reply");
