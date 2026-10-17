@@ -25,7 +25,7 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <string.h>
-#include <mach/mach_time.h>
+#include <time.h>
 
 #include "private.h"
 
@@ -33,10 +33,22 @@
 static uint64_t
 now_ns(void)
 {
-    mach_timebase_info_data_t timebase;
+    struct timespec now;
 
-    mach_timebase_info(&timebase);
-    return (mach_absolute_time() * timebase.numer / timebase.denom);
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return ((uint64_t) now.tv_sec * 1000000000ull + now.tv_nsec);
+}
+
+/* when a wait of timeout from now ends: UINT64_MAX if not within the clock's range */
+static uint64_t
+deadline_ns(const struct timespec *timeout)
+{
+    uint64_t now = now_ns();
+    uint64_t sec = timeout->tv_sec, nsec = timeout->tv_nsec;
+
+    if (sec > (UINT64_MAX - now - nsec) / 1000000000ull)
+        return (UINT64_MAX);
+    return (now + sec * 1000000000ull + nsec);
 }
 
 static const char *
@@ -409,7 +421,7 @@ kevent64_impl(int kqfd, const struct kevent64_s *changelist, int nchanges,
         uint64_t deadline = 0;
 
         if (ts != NULL && (ts->tv_sec > 0 || ts->tv_nsec > 0))
-            deadline = now_ns() + ts->tv_sec * 1000000000ull + ts->tv_nsec;
+            deadline = deadline_ns(ts);
 again:
         rv = kqops.kevent_wait(kq, nevents, ts);
         dbg_printf("kqops.kevent_wait returned %d", rv);
