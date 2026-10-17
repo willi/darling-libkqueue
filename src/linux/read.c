@@ -114,16 +114,7 @@ evfilt_read_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     if (ev->events & EPOLLHUP)
         dst->flags |= EV_EOF;
 #endif
-    /*
-     * XNU's filt_soread() and filt_sowrite() report a socket's pending error (so_error) as fflags at end of file,
-     * leaving it pending; EVFILT_SOCK's view of the socket has it (for-libkqueue.h). Other descriptors have none.
-     */
-    dst->fflags = 0;
-    if (ev->events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-        struct socket_state_4libkqueue st;
-        if (_socket_state_4libkqueue(src->kdata.kn_dupfd, &st) == 0)
-            dst->fflags = st.error;
-    }
+    dst->fflags = linux_socket_eof_error(src, ev->events);
           
     if (src->kn_flags & KNFL_PASSIVE_SOCKET) {
         /* On return, data contains the length of the 
