@@ -147,9 +147,11 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
             // but at the moment it just confuses clients
             kn->kev.flags &= ~EV_VANISHED;
 
-            if (filt->kn_create(filt, kn) < 0) {
+            // a filter can name the error, as -errno; any other failure is EBADF
+            int created = filt->kn_create(filt, kn);
+            if (created < 0) {
                 knote_release(kn);
-                errno = EBADF;
+                errno = created < -1 ? -created : EBADF;
                 return (-1);
             } 
             knote_insert(filt, kn);
