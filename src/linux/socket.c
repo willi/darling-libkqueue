@@ -11,10 +11,9 @@
  * socket (_socket_state_4libkqueue), and the knote turns them into notes as filt_sockev_common does:
  * - level-triggered notes (NOTE_CONNECTED, NOTE_DISCONNECTED, NOTE_READCLOSED, NOTE_WRITECLOSED, NOTE_RESUME) are
  *   reported while their state holds, but wake the program only once;
- * - XNU's one-shot hints come from the state changes that raise them: a new error is a reset (ECONNREFUSED,
- *   ECONNRESET: NOTE_CONNRESET) or a timeout (ETIMEDOUT, and the unreachable errors XNU's TCP reports when its
- *   retransmissions time out: NOTE_TIMEOUT); connecting or disconnecting updates TCP's connection info
- *   (NOTE_CONNINFO_UPDATED);
+ * - XNU's TCP's one-shot hints come from the state changes that raise them: libsystem_kernel counts the socket's
+ *   resets (NOTE_CONNRESET) and timeouts (NOTE_TIMEOUT) while a knote watches it, also those the program took before
+ *   the knote looked; connecting or disconnecting updates TCP's connection info (NOTE_CONNINFO_UPDATED);
  * - a pending error fires the knote with EV_EOF and the error as data, and stays pending for the program's SO_ERROR;
  * - data is otherwise SOCKEV_CONNECTED / SOCKEV_DISCONNECTED.
  * Sockets are never suspended (XNU suspends them for interface flow control), so NOTE_RESUME holds.
@@ -45,7 +44,8 @@ struct sock_knote {
     uint32_t fflags;    /* XNU's kn_fflags: notes gathered since the last delivery (with EV_CLEAR) */
     uint32_t delivered; /* XNU's kn_hook32: level-triggered notes already delivered */
     unsigned state;     /* the socket's state when last looked at, to tell what changed */
-    unsigned errors;    /* how many errors it had had then (struct socket_state_4libkqueue) */
+    unsigned resets;    /* the socket's reset and timeout counts then (struct socket_state_4libkqueue) */
+    unsigned timeouts;
     unsigned gen;       /* the kevent() copyout that last looked at it (KQUEUE_PLATFORM_SPECIFIC) */
     int efd;            /* wakes the knote outside the socket's events */
 };
@@ -57,25 +57,6 @@ static struct sock_knote *
 sock_knote(struct knote *kn)
 {
     return (struct sock_knote *) &kn->kn_extra_buffer[0];
-}
-
-/* The hint XNU's TCP posts with this error: tcp_input()'s RST handling, tcp_timers()' drops */
-static uint32_t
-error_hint(int error)
-{
-    switch (error) {
-    case ECONNREFUSED:
-    case ECONNRESET:
-        return NOTE_CONNRESET;
-    case ETIMEDOUT:
-    case EHOSTUNREACH:
-    case ENETUNREACH:
-    case EHOSTDOWN:
-    case ENETDOWN:
-        return NOTE_TIMEOUT;
-    default:
-        return 0;
-    }
 }
 
 /*
@@ -99,16 +80,24 @@ sock_evaluate(struct knote *kn, int hints, struct kevent64_s *out)
     state = st.state;
     error = st.error;
 
-    /* XNU's TCP posts these hints (other protocols post none); they're one-shot, so taken from what changed */
-    if (hints && (state & SOSTATE_EVCONNINFO)) {
-        /* a new error, even if something took it before the knote looked */
-        if (st.errors != sk->errors)
-            sk->fflags |= error_hint(st.last_error);
-        if (state & ~sk->state & (SOSTATE_ISCONNECTED | SOSTATE_ISDISCONNECTED))
-            sk->fflags |= NOTE_CONNINFO_UPDATED;
+    /*
+     * XNU's TCP posts these hints (other protocols post none); they're one-shot, so taken from what changed. The
+     * counts only grow: one below the knote's is the socket's, forgotten and remembered again.
+     */
+    hints = hints && (state & SOSTATE_EVCONNINFO);
+    if (st.resets > sk->resets) {
+        if (hints)
+            sk->fflags |= NOTE_CONNRESET;
+        sk->resets = st.resets;
     }
+    if (st.timeouts > sk->timeouts) {
+        if (hints)
+            sk->fflags |= NOTE_TIMEOUT;
+        sk->timeouts = st.timeouts;
+    }
+    if (hints && (state & ~sk->state & (SOSTATE_ISCONNECTED | SOSTATE_ISDISCONNECTED)))
+        sk->fflags |= NOTE_CONNINFO_UPDATED;
     sk->state = state;
-    sk->errors = st.errors;
 
     if (state & SOSTATE_ISCONNECTED) {
         sk->fflags |= NOTE_CONNECTED;
@@ -173,15 +162,6 @@ sock_wake(struct knote *kn)
     (void) write(sock_knote(kn)->efd, &one, sizeof(one));
 }
 
-/* EVFILT_SOCK knotes in the process: kqueue_socket_changed() looks for them only while there are any */
-static volatile int sock_knotes;
-
-int
-evfilt_sock_active(void)
-{
-    return (sock_knotes != 0);
-}
-
 void
 evfilt_sock_changed(struct knote *kn)
 {
@@ -231,6 +211,12 @@ evfilt_sock_copyout(struct kevent64_s *dst, struct knote *kn, void *ptr UNUSED)
     struct sock_knote *sk = sock_knote(kn);
     uint64_t count;
 
+    /* another thread's kevent() delivered it from its other epoll entry, and disabled it (EV_DISPATCH) */
+    if (kn->kev.flags & EV_DISABLE) {
+        dst->filter = EVFILT_DROP;
+        return (0);
+    }
+
     /* the knote's other epoll entry was ready too, in this same kevent(): it has been reported (or dropped) */
     if (sk->gen == kn->kn_kq->kq_copyout_gen) {
         dst->filter = EVFILT_DROP;
@@ -260,19 +246,28 @@ evfilt_sock_knote_create(struct filter *filt, struct knote *kn)
     struct socket_state_4libkqueue st;
     int ret;
 
+    /* watched first: an error the program takes while the knote attaches is counted for it */
+    _socket_watch_4libkqueue(kn->kev.ident, 1);
+
     /* XNU's sokqfilter() takes EVFILT_SOCK on sockets; the other descriptors' kqfilters refuse it */
     ret = _socket_state_4libkqueue(kn->kev.ident, &st);
-    if (ret < 0)
+    if (ret < 0) {
+        _socket_watch_4libkqueue(kn->kev.ident, -1);
         return (ret == -ENOTSOCK ? -EINVAL : ret);
+    }
 
     memset(sk, 0, sizeof(*sk));
     sk->efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-    if (sk->efd < 0)
-        return (-errno);
+    if (sk->efd < 0) {
+        ret = -errno;
+        _socket_watch_4libkqueue(kn->kev.ident, -1);
+        return (ret);
+    }
     kn->kdata.kn_dupfd = _dup_4libkqueue(kn->kev.ident);
     if (kn->kdata.kn_dupfd < 0) {
         ret = kn->kdata.kn_dupfd;
         (void) __close_for_kqueue(sk->efd);
+        _socket_watch_4libkqueue(kn->kev.ident, -1);
         return (ret);
     }
     kn->kn_epollfd = filter_epfd(filt);
@@ -284,12 +279,11 @@ evfilt_sock_knote_create(struct filter *filt, struct knote *kn)
     ret = sock_watch(kn);
     if (ret < 0) {
         sock_unwatch(kn);
+        _socket_watch_4libkqueue(kn->kdata.kn_dupfd, -1);
         (void) __close_for_kqueue(kn->kdata.kn_dupfd);
         (void) __close_for_kqueue(sk->efd);
         return (ret);
     }
-    _socket_watch_4libkqueue(1);
-    __atomic_add_fetch(&sock_knotes, 1, __ATOMIC_RELAXED);
     return (0);
 }
 
@@ -314,12 +308,12 @@ evfilt_sock_knote_delete(struct filter *filt UNUSED, struct knote *kn)
 {
     if (!(kn->kev.flags & EV_DISABLE))
         sock_unwatch(kn);
+    /* while the copy still names the socket */
+    _socket_watch_4libkqueue(kn->kdata.kn_dupfd, -1);
     (void) __close_for_kqueue(kn->kdata.kn_dupfd);
     (void) __close_for_kqueue(sock_knote(kn)->efd);
     kn->kdata.kn_dupfd = -1;
     sock_knote(kn)->efd = -1;
-    _socket_watch_4libkqueue(-1);
-    __atomic_sub_fetch(&sock_knotes, 1, __ATOMIC_RELAXED);
     return (0);
 }
 
@@ -348,10 +342,20 @@ evfilt_sock_knote_disable(struct filter *filt UNUSED, struct knote *kn)
     return (0);
 }
 
+/*
+ * The kqueue is being freed: its knotes go, as XNU's kqueue_close() drops a kqueue's knotes, so that their sockets'
+ * watches stop and their copies of the sockets are closed
+ */
+static void
+evfilt_sock_destroy(struct filter *filt)
+{
+    knote_delete_all(filt);
+}
+
 const struct filter evfilt_sock = {
     EVFILT_SOCK,
     NULL,
-    NULL,
+    evfilt_sock_destroy,
     evfilt_sock_copyout,
     evfilt_sock_knote_create,
     evfilt_sock_knote_modify,

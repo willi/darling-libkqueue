@@ -231,8 +231,7 @@ int kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src);
  */
 struct knote * knote_lookup(struct filter *, uintptr_t);
 
-/* EVFILT_SOCK (src/linux/socket.c): whether any knote exists, and waking one to look at its socket again */
-int  evfilt_sock_active(void);
+/* EVFILT_SOCK (src/linux/socket.c): wakes a knote to look at its socket again */
 void evfilt_sock_changed(struct knote *);
 //DEADWOOD: struct knote * knote_get_by_data(struct filter *filt, intptr_t);
 struct knote * knote_new(void);
@@ -240,6 +239,8 @@ struct knote * knote_new(void);
 void knote_release(struct knote *);
 void knote_insert(struct filter *, struct knote *);
 int  knote_delete(struct filter *, struct knote *);
+/* Deletes every knote of the filter, whose kqueue is being freed */
+void knote_delete_all(struct filter *);
 int  knote_init(void);
 int  knote_disable(struct filter *, struct knote *);
 #define knote_get_filter(knt) &((knt)->kn_kq->kq_filt[(knt)->kev.filter])
