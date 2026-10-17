@@ -276,6 +276,49 @@ kqueue_closed_fd(int fd)
 	errno = saved_errno;
 }
 
+// Darling's libsystem_kernel calls this after connect() and shutdown() on socket fd: XNU's soevent() wakes the
+// socket's EVFILT_SOCK knotes for those changes, and Linux wakes no one for some of them (a datagram socket connecting,
+// an AF_UNIX socket shutting down its sending side). The knote then looks at the socket again.
+void VISIBLE
+kqueue_socket_changed(int fd)
+{
+	if (kqmap == NULL || !evfilt_sock_active())
+		return;
+
+	int saved_errno = errno;
+	struct kqueue_close_context context;
+	context.kqs_to_check = context.kqs_to_check_buffer;
+	context.buffer_size = sizeof(context.kqs_to_check_buffer) / sizeof(*context.kqs_to_check_buffer);
+	context.kq_count = 0;
+	context.dynamic_buffer = false;
+
+	pthread_mutex_lock(&kq_mtx);
+	map_foreach(kqmap, kqueue_close_ref_cb, &context);
+	pthread_mutex_unlock(&kq_mtx);
+
+	for (size_t i = 0; i < context.kq_count; ++i) {
+		struct kqueue* kq = context.kqs_to_check[i];
+		struct filter* filt;
+
+		kqueue_lock(kq);
+		if (filter_lookup(&filt, kq, EVFILT_SOCK) == 0) {
+			struct knote* kn = knote_lookup(filt, fd);
+			if (kn != NULL)
+				evfilt_sock_changed(kn);
+		}
+		kqueue_unlock(kq);
+	}
+
+	pthread_mutex_lock(&kq_mtx);
+	for (size_t i = 0; i < context.kq_count; ++i)
+		kqueue_delref(context.kqs_to_check[i]);
+	pthread_mutex_unlock(&kq_mtx);
+
+	if (context.dynamic_buffer)
+		free(context.kqs_to_check);
+	errno = saved_errno;
+}
+
 // FIXME: this can race with someone closing the old FD right after it's dup'ed but before we're informed.
 //        we should add a reference on the old FD before trying to dup it, then dup it, and then assign the reference
 //        to the new FD if the dup succeeded or delete the reference if the dup failed.

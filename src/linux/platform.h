@@ -85,7 +85,9 @@ extern long int syscall (long int __sysno, ...);
  */
 #define KQUEUE_PLATFORM_SPECIFIC \
     struct epoll_event kq_plist[MAX_KEVENT]; \
-    size_t kq_nplist
+    size_t kq_nplist; \
+    /* counts linux_kevent_copyout() calls: a knote with two epoll entries reports once per call (socket.c) */ \
+    unsigned int kq_copyout_gen
 
 int     linux_kqueue_init(struct kqueue *);
 void    linux_kqueue_free(struct kqueue *);

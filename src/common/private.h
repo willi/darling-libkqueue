@@ -151,6 +151,10 @@ struct filter {
 
     /* knote operations */
 
+    /*
+     * Returns 0, or a negative errno for kevent() to fail the registration with. -1 means EBADF (as when filters
+     * returned -1 on any failure), so a filter can't name EPERM.
+     */
     int     (*kn_create)(struct filter *, struct knote *);
     int     (*kn_modify)(struct filter *, struct knote *, 
                             const struct kevent64_s *);
@@ -226,6 +230,10 @@ int kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src);
  * knote internal API
  */
 struct knote * knote_lookup(struct filter *, uintptr_t);
+
+/* EVFILT_SOCK (src/linux/socket.c): whether any knote exists, and waking one to look at its socket again */
+int  evfilt_sock_active(void);
+void evfilt_sock_changed(struct knote *);
 //DEADWOOD: struct knote * knote_get_by_data(struct filter *filt, intptr_t);
 struct knote * knote_new(void);
 #define knote_retain(kn) atomic_inc(&kn->kn_ref)

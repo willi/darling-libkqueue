@@ -45,7 +45,8 @@ struct sock_knote {
     uint32_t fflags;    /* XNU's kn_fflags: notes gathered since the last delivery (with EV_CLEAR) */
     uint32_t delivered; /* XNU's kn_hook32: level-triggered notes already delivered */
     unsigned state;     /* the socket's state when last looked at, to tell what changed */
-    int error;          /* its pending error when last looked at */
+    unsigned errors;    /* how many errors it had had then (struct socket_state_4libkqueue) */
+    unsigned gen;       /* the kevent() copyout that last looked at it (KQUEUE_PLATFORM_SPECIFIC) */
     int efd;            /* wakes the knote outside the socket's events */
 };
 
@@ -86,23 +87,28 @@ static int
 sock_evaluate(struct knote *kn, int hints, struct kevent64_s *out)
 {
     struct sock_knote *sk = sock_knote(kn);
+    struct socket_state_4libkqueue st;
     unsigned state;
     int error;
     uint32_t level = 0;
     int64_t data;
     int ret = 0;
 
-    if (_socket_state_4libkqueue(kn->kdata.kn_dupfd, &state, &error) < 0)
+    if (_socket_state_4libkqueue(kn->kdata.kn_dupfd, &st) < 0)
         return (0);
+    state = st.state;
+    error = st.error;
 
-    if (hints) {
-        if (error != 0 && error != sk->error)
-            sk->fflags |= error_hint(error);
-        if ((state & SOSTATE_EVCONNINFO) && (state & ~sk->state & (SOSTATE_ISCONNECTED | SOSTATE_ISDISCONNECTED)))
+    /* XNU's TCP posts these hints (other protocols post none); they're one-shot, so taken from what changed */
+    if (hints && (state & SOSTATE_EVCONNINFO)) {
+        /* a new error, even if something took it before the knote looked */
+        if (st.errors != sk->errors)
+            sk->fflags |= error_hint(st.last_error);
+        if (state & ~sk->state & (SOSTATE_ISCONNECTED | SOSTATE_ISDISCONNECTED))
             sk->fflags |= NOTE_CONNINFO_UPDATED;
     }
     sk->state = state;
-    sk->error = error;
+    sk->errors = st.errors;
 
     if (state & SOSTATE_ISCONNECTED) {
         sk->fflags |= NOTE_CONNECTED;
@@ -167,30 +173,49 @@ sock_wake(struct knote *kn)
     (void) write(sock_knote(kn)->efd, &one, sizeof(one));
 }
 
+/* EVFILT_SOCK knotes in the process: kqueue_socket_changed() looks for them only while there are any */
+static volatile int sock_knotes;
+
+int
+evfilt_sock_active(void)
+{
+    return (sock_knotes != 0);
+}
+
+void
+evfilt_sock_changed(struct knote *kn)
+{
+    if (!(kn->kev.flags & EV_DISABLE))
+        sock_wake(kn);
+}
+
+/* Watches fd in the knote's epoll set; one already watched counts (enabling an enabled knote, as XNU allows) */
 static int
-sock_epoll(struct knote *kn, int op)
+sock_watch_one(struct knote *kn, int fd, uint32_t events)
 {
     struct epoll_event ev;
 
-    /*
-     * EPOLLOUT: a connect completing, and the shutdowns Linux reports no other way; RDHUP, HUP, ERR: the rest.
-     * Edge-triggered, a socket that stays writable doesn't wake the knote again; data arriving never does.
-     */
     memset(&ev, 0, sizeof(ev));
-    ev.events = EPOLLOUT | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+    ev.events = events;
     ev.data.ptr = kn;
-    if (epoll_ctl(kn->kn_epollfd, op, kn->kdata.kn_dupfd, &ev) < 0)
-        return (-1);
-
-    memset(&ev, 0, sizeof(ev));
-    ev.events = EPOLLIN | EPOLLET;
-    ev.data.ptr = kn;
-    if (epoll_ctl(kn->kn_epollfd, op, sock_knote(kn)->efd, &ev) < 0) {
-        if (op == EPOLL_CTL_ADD)
-            (void) epoll_ctl(kn->kn_epollfd, EPOLL_CTL_DEL, kn->kdata.kn_dupfd, NULL);
-        return (-1);
-    }
+    if (epoll_ctl(kn->kn_epollfd, EPOLL_CTL_ADD, fd, &ev) < 0 && errno != EEXIST)
+        return (-errno);
     return (0);
+}
+
+/*
+ * EPOLLOUT: a connect completing, and the shutdowns Linux reports no other way; RDHUP, HUP, ERR: the rest.
+ * Edge-triggered, a socket that stays writable doesn't wake the knote again; data arriving never does. Both entries
+ * carry the knote, so one kevent() can return it twice: evfilt_sock_copyout() reports it once.
+ */
+static int
+sock_watch(struct knote *kn)
+{
+    int ret = sock_watch_one(kn, kn->kdata.kn_dupfd, EPOLLOUT | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET);
+
+    if (ret == 0)
+        ret = sock_watch_one(kn, sock_knote(kn)->efd, EPOLLIN | EPOLLET);
+    return (ret);
 }
 
 static void
@@ -203,10 +228,18 @@ sock_unwatch(struct knote *kn)
 int
 evfilt_sock_copyout(struct kevent64_s *dst, struct knote *kn, void *ptr UNUSED)
 {
+    struct sock_knote *sk = sock_knote(kn);
     uint64_t count;
 
+    /* the knote's other epoll entry was ready too, in this same kevent(): it has been reported (or dropped) */
+    if (sk->gen == kn->kn_kq->kq_copyout_gen) {
+        dst->filter = EVFILT_DROP;
+        return (0);
+    }
+    sk->gen = kn->kn_kq->kq_copyout_gen;
+
     /* whichever woke it */
-    (void) read(sock_knote(kn)->efd, &count, sizeof(count));
+    (void) read(sk->efd, &count, sizeof(count));
 
     if (!sock_evaluate(kn, 1, dst)) {
         dst->filter = EVFILT_DROP;
@@ -219,27 +252,28 @@ evfilt_sock_copyout(struct kevent64_s *dst, struct knote *kn, void *ptr UNUSED)
     return (0);
 }
 
+/* Returns 0, or a negative errno (kn_create's convention, private.h) */
 int
 evfilt_sock_knote_create(struct filter *filt, struct knote *kn)
 {
     struct sock_knote *sk = sock_knote(kn);
-    unsigned state;
-    int error;
+    struct socket_state_4libkqueue st;
     int ret;
 
     /* XNU's sokqfilter() takes EVFILT_SOCK on sockets; the other descriptors' kqfilters refuse it */
-    ret = _socket_state_4libkqueue(kn->kev.ident, &state, &error);
+    ret = _socket_state_4libkqueue(kn->kev.ident, &st);
     if (ret < 0)
         return (ret == -ENOTSOCK ? -EINVAL : ret);
 
     memset(sk, 0, sizeof(*sk));
     sk->efd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (sk->efd < 0)
-        return (-1);
+        return (-errno);
     kn->kdata.kn_dupfd = _dup_4libkqueue(kn->kev.ident);
     if (kn->kdata.kn_dupfd < 0) {
+        ret = kn->kdata.kn_dupfd;
         (void) __close_for_kqueue(sk->efd);
-        return (-1);
+        return (ret);
     }
     kn->kn_epollfd = filter_epfd(filt);
 
@@ -247,11 +281,15 @@ evfilt_sock_knote_create(struct filter *filt, struct knote *kn)
     if (sock_evaluate(kn, 0, NULL))
         sock_wake(kn);
 
-    if (sock_epoll(kn, EPOLL_CTL_ADD) < 0) {
+    ret = sock_watch(kn);
+    if (ret < 0) {
+        sock_unwatch(kn);
         (void) __close_for_kqueue(kn->kdata.kn_dupfd);
         (void) __close_for_kqueue(sk->efd);
-        return (-1);
+        return (ret);
     }
+    _socket_watch_4libkqueue(1);
+    __atomic_add_fetch(&sock_knotes, 1, __ATOMIC_RELAXED);
     return (0);
 }
 
@@ -280,14 +318,27 @@ evfilt_sock_knote_delete(struct filter *filt UNUSED, struct knote *kn)
     (void) __close_for_kqueue(sock_knote(kn)->efd);
     kn->kdata.kn_dupfd = -1;
     sock_knote(kn)->efd = -1;
+    _socket_watch_4libkqueue(-1);
+    __atomic_sub_fetch(&sock_knotes, 1, __ATOMIC_RELAXED);
     return (0);
 }
 
 int
 evfilt_sock_knote_enable(struct filter *filt UNUSED, struct knote *kn)
 {
-    /* the readiness epoll finds when watching again wakes the knote if it has something to report */
-    return (sock_epoll(kn, EPOLL_CTL_ADD));
+    int ret = sock_watch(kn);
+
+    /* not watched at all rather than by half: it stays disabled */
+    if (ret < 0) {
+        sock_unwatch(kn);
+        kn->kev.flags |= EV_DISABLE;
+        errno = -ret;
+        return (-1);
+    }
+    /* XNU's knote_enable() looks at an enabled knote again: what it has to report doesn't wait for a new edge */
+    if (sock_evaluate(kn, 1, NULL))
+        sock_wake(kn);
+    return (0);
 }
 
 int

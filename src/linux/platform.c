@@ -199,6 +199,7 @@ linux_kevent_copyout(struct kqueue *kq, int nready,
     int i, nret, rv;
     struct kevent64_s* event;
 
+    kq->kq_copyout_gen++;
     nret = nready;
     for (i = 0; i < nready; i++) {
         ev = &epevt_get()[i];
