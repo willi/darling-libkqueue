@@ -77,6 +77,34 @@ struct eventfd {
 #define KNFL_DEFER_DELETE    (0x04)  /* Defer deletion until re-enabled */
 #define KNFL_KNOTE_DELETED   (0x10)  /* The knote object is no longer valid */
 
+/*
+ * XNU's private socket filter (bsd/sys/event.h, PRIVATE), which the SDK's headers leave out
+ */
+#ifndef EVFILT_SOCK
+#define EVFILT_SOCK             (-13)
+#define NOTE_CONNRESET          0x00000001
+#define NOTE_READCLOSED         0x00000002
+#define NOTE_WRITECLOSED        0x00000004
+#define NOTE_TIMEOUT            0x00000008
+#define NOTE_NOSRCADDR          0x00000010
+#define NOTE_IFDENIED           0x00000020
+#define NOTE_SUSPEND            0x00000040
+#define NOTE_RESUME             0x00000080
+#define NOTE_KEEPALIVE          0x00000100
+#define NOTE_ADAPTIVE_WTIMO     0x00000200
+#define NOTE_ADAPTIVE_RTIMO     0x00000400
+#define NOTE_CONNECTED          0x00000800
+#define NOTE_DISCONNECTED       0x00001000
+#define NOTE_CONNINFO_UPDATED   0x00002000
+#define NOTE_NOTIFY_ACK         0x00004000
+#define EVFILT_SOCK_LEVEL_TRIGGER_MASK \
+        (NOTE_READCLOSED | NOTE_WRITECLOSED | NOTE_SUSPEND | NOTE_RESUME | NOTE_CONNECTED | NOTE_DISCONNECTED)
+#define EVFILT_SOCK_ALL_MASK \
+        (NOTE_CONNRESET | NOTE_READCLOSED | NOTE_WRITECLOSED | NOTE_TIMEOUT | NOTE_NOSRCADDR | NOTE_IFDENIED | \
+        NOTE_SUSPEND | NOTE_RESUME | NOTE_KEEPALIVE | NOTE_ADAPTIVE_WTIMO | NOTE_ADAPTIVE_RTIMO | NOTE_CONNECTED | \
+        NOTE_DISCONNECTED | NOTE_CONNINFO_UPDATED | NOTE_NOTIFY_ACK)
+#endif
+
 #define EVFILT_DROP 0
 #define EVFILT_DROP_POSTPROCESS (EVFILT_SYSCOUNT + 1)
  
@@ -123,6 +151,10 @@ struct filter {
 
     /* knote operations */
 
+    /*
+     * Returns 0, or a negative errno for kevent() to fail the registration with. -1 means EBADF (as when filters
+     * returned -1 on any failure), so a filter can't name EPERM.
+     */
     int     (*kn_create)(struct filter *, struct knote *);
     int     (*kn_modify)(struct filter *, struct knote *, 
                             const struct kevent64_s *);
@@ -198,12 +230,17 @@ int kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src);
  * knote internal API
  */
 struct knote * knote_lookup(struct filter *, uintptr_t);
+
+/* EVFILT_SOCK (src/linux/socket.c): wakes a knote to look at its socket again */
+void evfilt_sock_changed(struct knote *);
 //DEADWOOD: struct knote * knote_get_by_data(struct filter *filt, intptr_t);
 struct knote * knote_new(void);
 #define knote_retain(kn) atomic_inc(&kn->kn_ref)
 void knote_release(struct knote *);
 void knote_insert(struct filter *, struct knote *);
 int  knote_delete(struct filter *, struct knote *);
+/* Deletes every knote of the filter, whose kqueue is being freed */
+void knote_delete_all(struct filter *);
 int  knote_init(void);
 int  knote_disable(struct filter *, struct knote *);
 #define knote_get_filter(knt) &((knt)->kn_kq->kq_filt[(knt)->kev.filter])

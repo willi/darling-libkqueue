@@ -46,8 +46,7 @@ evfilt_socket_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     if (ev->events & EPOLLHUP)
         dst->flags |= EV_EOF;
 #endif
-    if (ev->events & EPOLLERR)
-        dst->fflags = 1; /* FIXME: Return the actual socket error */
+    dst->fflags = linux_socket_eof_error(src, ev->events);
           
     /* On return, data contains the the amount of space remaining in the write buffer */
     if (ioctl(dst->ident, TIOCOUTQ, &dst->data) < 0) {

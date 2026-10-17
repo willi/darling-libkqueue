@@ -114,8 +114,7 @@ evfilt_read_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
     if (ev->events & EPOLLHUP)
         dst->flags |= EV_EOF;
 #endif
-    if (ev->events & EPOLLERR)
-        dst->fflags = 1; /* FIXME: Return the actual socket error */
+    dst->fflags = linux_socket_eof_error(src, ev->events);
           
     if (src->kn_flags & KNFL_PASSIVE_SOCKET) {
         /* On return, data contains the length of the 

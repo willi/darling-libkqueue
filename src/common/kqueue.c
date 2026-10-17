@@ -26,6 +26,8 @@
 
 #ifdef DARLING
 #include "../darling/listenregistry.h"
+// the hooks libsystem_kernel calls (kqueue_close(), kqueue_closed_fd(), kqueue_dup(), kqueue_socket_changed())
+#include <darling/emulation/linux_premigration/ext/for-libkqueue.h>
 #endif
 
 int DEBUG_KQUEUE = 0;
@@ -201,43 +203,23 @@ static void kqueue_close_ref_cb(int kqfd, void* kqptr, void* private) {
 	kqueue_addref(kq);
 };
 
-// this function is too expensive for how often it can be called (which is every time an FD is closed).
-// if possible, this should be optimized or, better yet, we should just completely refactor libkqueue so that
-// some of the things this function needs to do are no longer necessary (like walking through every single kqueue).
-void VISIBLE
-kqueue_closed_fd(int fd)
+// Calls fn(kq, arg) for every kqueue, each under its lock. kq_mtx is held only while the kqueues are collected (with a
+// reference each), since fn may take other locks.
+//
+// FIXME: this is a terrible solution. another (possible better) solution would be to keep a map that maps FDs
+//        to the kqueues they're in. then, each FD would hold a reference on the kqueues they're in and we can
+//        just access those kqueues without additional locks (only the individual kqueue lock).
+//
+// Neither kq_mtx nor the kqueue locks block signals, so a signal handler whose close(), connect() or shutdown() comes
+// here can deadlock on a lock its own thread holds (as libsystem_kernel's sigsafe_lock.h tables can't).
+static void
+kqueue_foreach(void (*fn)(struct kqueue *, void *), void *arg)
 {
-	if (kqmap == NULL)
-		return;
-
-	// close() succeeded, which leaves errno alone; the deletions below set it for each kqueue the fd isn't in
-	int saved_errno = errno;
-	struct kevent64_s ev[2];
-
-	ev[0].ident = fd;
-	ev[0].flags = EV_DELETE | EV_RECEIPT;
-	ev[0].filter = EVFILT_READ;
-	ev[1].ident = fd;
-	ev[1].flags = EV_DELETE | EV_RECEIPT;
-	ev[1].filter = EVFILT_WRITE;
-
-	// we know it's not a kqueue FD (since kqueue_close() takes care of those),
-	// but it could be a fd inside a kqueue. Since we're creating duplicates of all fd's,
-	// we now have to walk through all known kqueues and remove the fd from them.
-
 	struct kqueue_close_context context;
 	context.kqs_to_check = context.kqs_to_check_buffer;
 	context.buffer_size = sizeof(context.kqs_to_check_buffer) / sizeof(*context.kqs_to_check_buffer);
 	context.kq_count = 0;
 	context.dynamic_buffer = false;
-
-	// we first have to copy all current kqueues into a buffer so we can check them with the kq_mtx dropped.
-	// this is necessary because some of the operations we perform should not be performed with the kq_mtx held.
-    // (e.g. acquiring other locks like the individual kqueue locks)
-	//
-	// FIXME: this is a terrible solution. another (possible better) solution would be to keep a map that maps FDs
-	//        to the kqueues they're in. then, each FD would hold a reference on the kqueues they're in and we can
-	//        just access those kqueues without additional locks (only the individual kqueue lock).
 
 	pthread_mutex_lock(&kq_mtx);
 	map_foreach(kqmap, kqueue_close_ref_cb, &context);
@@ -247,9 +229,7 @@ kqueue_closed_fd(int fd)
 		struct kqueue* kq = context.kqs_to_check[i];
 
 		kqueue_lock(kq);
-		// we don't care whether these operations succeed or not
-		kevent_copyin_one(kq, &ev[0]);
-		kevent_copyin_one(kq, &ev[1]);
+		fn(kq, arg);
 		kqueue_unlock(kq);
 	}
 
@@ -264,11 +244,79 @@ kqueue_closed_fd(int fd)
 	if (context.dynamic_buffer) {
 		free(context.kqs_to_check);
 	}
+}
+
+static void
+kqueue_closed_fd_cb(struct kqueue *kq, void *arg)
+{
+	struct kevent64_s *ev = arg;
+
+	// we don't care whether these operations succeed or not
+	kevent_copyin_one(kq, &ev[0]);
+	kevent_copyin_one(kq, &ev[1]);
+	kevent_copyin_one(kq, &ev[2]);
+}
+
+// this function is too expensive for how often it can be called (which is every time an FD is closed).
+// if possible, this should be optimized or, better yet, we should just completely refactor libkqueue so that
+// some of the things this function needs to do are no longer necessary (like walking through every single kqueue).
+void VISIBLE
+kqueue_closed_fd(int fd)
+{
+	if (kqmap == NULL)
+		return;
+
+	// close() succeeded, which leaves errno alone; the deletions below set it for each kqueue the fd isn't in
+	int saved_errno = errno;
+	struct kevent64_s ev[3];
+
+	ev[0].ident = fd;
+	ev[0].flags = EV_DELETE | EV_RECEIPT;
+	ev[0].filter = EVFILT_READ;
+	ev[1].ident = fd;
+	ev[1].flags = EV_DELETE | EV_RECEIPT;
+	ev[1].filter = EVFILT_WRITE;
+	ev[2].ident = fd;
+	ev[2].flags = EV_DELETE | EV_RECEIPT;
+	ev[2].filter = EVFILT_SOCK;
+
+	// we know it's not a kqueue FD (since kqueue_close() takes care of those),
+	// but it could be a fd inside a kqueue. Since we're creating duplicates of all fd's,
+	// we now have to walk through all known kqueues and remove the fd from them.
+	kqueue_foreach(kqueue_closed_fd_cb, ev);
 
 #ifdef DARLING
     __darling_kqueue_unregister_listen(fd);
 #endif
 
+	errno = saved_errno;
+}
+
+static void
+kqueue_socket_changed_cb(struct kqueue *kq, void *arg)
+{
+	struct filter *filt;
+	struct knote *kn;
+
+	if (filter_lookup(&filt, kq, EVFILT_SOCK) == 0) {
+		kn = knote_lookup(filt, *(int *) arg);
+		if (kn != NULL)
+			evfilt_sock_changed(kn);
+	}
+}
+
+// Darling's libsystem_kernel calls this after connect() and shutdown() on socket fd, while EVFILT_SOCK knotes exist
+// (for-libkqueue.h): XNU's soevent() wakes the socket's EVFILT_SOCK knotes for those changes, and Linux wakes no one
+// for some of them (a datagram socket connecting, a shutdown of only sending). The knote then looks at the socket
+// again.
+void VISIBLE
+kqueue_socket_changed(int fd)
+{
+	if (kqmap == NULL)
+		return;
+
+	int saved_errno = errno;
+	kqueue_foreach(kqueue_socket_changed_cb, &fd);
 	errno = saved_errno;
 }
 
