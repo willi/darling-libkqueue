@@ -212,7 +212,7 @@ kqueue_closed_fd(int fd)
 
 	// close() succeeded, which leaves errno alone; the deletions below set it for each kqueue the fd isn't in
 	int saved_errno = errno;
-	struct kevent64_s ev[2];
+	struct kevent64_s ev[3];
 
 	ev[0].ident = fd;
 	ev[0].flags = EV_DELETE | EV_RECEIPT;
@@ -220,6 +220,9 @@ kqueue_closed_fd(int fd)
 	ev[1].ident = fd;
 	ev[1].flags = EV_DELETE | EV_RECEIPT;
 	ev[1].filter = EVFILT_WRITE;
+	ev[2].ident = fd;
+	ev[2].flags = EV_DELETE | EV_RECEIPT;
+	ev[2].filter = EVFILT_SOCK;
 
 	// we know it's not a kqueue FD (since kqueue_close() takes care of those),
 	// but it could be a fd inside a kqueue. Since we're creating duplicates of all fd's,
@@ -250,6 +253,7 @@ kqueue_closed_fd(int fd)
 		// we don't care whether these operations succeed or not
 		kevent_copyin_one(kq, &ev[0]);
 		kevent_copyin_one(kq, &ev[1]);
+		kevent_copyin_one(kq, &ev[2]);
 		kqueue_unlock(kq);
 	}
 
