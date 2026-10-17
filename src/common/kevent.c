@@ -25,8 +25,19 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <string.h>
+#include <mach/mach_time.h>
 
 #include "private.h"
+
+/* now, in nanoseconds of the monotonic clock */
+static uint64_t
+now_ns(void)
+{
+    mach_timebase_info_data_t timebase;
+
+    mach_timebase_info(&timebase);
+    return (mach_absolute_time() * timebase.numer / timebase.denom);
+}
 
 static const char *
 kevent_filter_dump(const struct kevent64_s *kev)
@@ -394,6 +405,11 @@ kevent64_impl(int kqfd, const struct kevent64_s *changelist, int nchanges,
         nevents = MAX_KEVENT;
     if ((flags & KEVENT_FLAG_ERROR_EVENTS) == 0 && nevents > 0) {
         const struct timespec* ts = (flags & KEVENT_FLAG_IMMEDIATE) ? (&timeout_zero) : timeout;
+        struct timespec left;
+        uint64_t deadline = 0;
+
+        if (ts != NULL && (ts->tv_sec > 0 || ts->tv_nsec > 0))
+            deadline = now_ns() + ts->tv_sec * 1000000000ull + ts->tv_nsec;
 again:
         rv = kqops.kevent_wait(kq, nevents, ts);
         dbg_printf("kqops.kevent_wait returned %d", rv);
@@ -408,10 +424,21 @@ again:
         kqueue_unlock(kq);
 
         if (rv == 0) {
-            /* Timeout reached */
-            /* Avoid returning 0 when waiting indefinitely in case of spurious wakeups */
+            /*
+             * Timeout reached, or every event was dropped (a filter found nothing to report): XNU's kevent()
+             * returns 0 only when the timeout expires, so wait for what's left of it
+             */
             if (ts == NULL)
                 goto again;
+            if (deadline != 0 && ret == 0) {
+                uint64_t now = now_ns();
+                if (now < deadline) {
+                    left.tv_sec = (deadline - now) / 1000000000ull;
+                    left.tv_nsec = (deadline - now) % 1000000000ull;
+                    ts = &left;
+                    goto again;
+                }
+            }
         } else {
             dbg_printf("(%u) kevent_wait failed", myid);
             goto out;
