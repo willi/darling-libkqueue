@@ -21,6 +21,7 @@
 
 #ifdef DARLING
 #include "../darling/listenregistry.h"
+#include <darling/emulation/linux_premigration/ext/for-libkqueue.h>
 #endif
 
 /*
@@ -199,6 +200,7 @@ linux_kevent_copyout(struct kqueue *kq, int nready,
     int i, nret, rv;
     struct kevent64_s* event;
 
+    kq->kq_copyout_gen++;
     nret = nready;
     for (i = 0; i < nready; i++) {
         ev = &epevt_get()[i];
@@ -445,3 +447,19 @@ linux_fd_to_path(char *buf, size_t bufsz, int fd)
     return (readlink(path, buf, bufsz));
 }
 
+
+/*
+ * XNU's filt_soread() and filt_sowrite() report a socket's pending error (so_error) as fflags at end of file, leaving
+ * it pending (libsystem_kernel's view of the socket has it: for-libkqueue.h). Other descriptors have none.
+ */
+uint32_t
+linux_socket_eof_error(struct knote *kn, uint32_t events)
+{
+    if (!(events & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)))
+        return (0);
+#ifdef DARLING
+    return (_socket_error_4libkqueue(kn->kdata.kn_dupfd, (events & EPOLLERR) != 0));
+#else
+    return (0);
+#endif
+}

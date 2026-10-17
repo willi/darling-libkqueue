@@ -25,8 +25,31 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <string.h>
+#include <time.h>
 
 #include "private.h"
+
+/* now, in nanoseconds of the monotonic clock */
+static uint64_t
+now_ns(void)
+{
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return ((uint64_t) now.tv_sec * 1000000000ull + now.tv_nsec);
+}
+
+/* when a wait of timeout from now ends: UINT64_MAX if not within the clock's range */
+static uint64_t
+deadline_ns(const struct timespec *timeout)
+{
+    uint64_t now = now_ns();
+    uint64_t sec = timeout->tv_sec, nsec = timeout->tv_nsec;
+
+    if (sec > (UINT64_MAX - now - nsec) / 1000000000ull)
+        return (UINT64_MAX);
+    return (now + sec * 1000000000ull + nsec);
+}
 
 static const char *
 kevent_filter_dump(const struct kevent64_s *kev)
@@ -147,9 +170,11 @@ kevent_copyin_one(struct kqueue *kq, const struct kevent64_s *src)
             // but at the moment it just confuses clients
             kn->kev.flags &= ~EV_VANISHED;
 
-            if (filt->kn_create(filt, kn) < 0) {
+            // a filter can name the error, as -errno; any other failure is EBADF
+            int created = filt->kn_create(filt, kn);
+            if (created < 0) {
                 knote_release(kn);
-                errno = EBADF;
+                errno = created < -1 ? -created : EBADF;
                 return (-1);
             } 
             knote_insert(filt, kn);
@@ -392,6 +417,11 @@ kevent64_impl(int kqfd, const struct kevent64_s *changelist, int nchanges,
         nevents = MAX_KEVENT;
     if ((flags & KEVENT_FLAG_ERROR_EVENTS) == 0 && nevents > 0) {
         const struct timespec* ts = (flags & KEVENT_FLAG_IMMEDIATE) ? (&timeout_zero) : timeout;
+        struct timespec left;
+        uint64_t deadline = 0;
+
+        if (ts != NULL && (ts->tv_sec > 0 || ts->tv_nsec > 0))
+            deadline = deadline_ns(ts);
 again:
         rv = kqops.kevent_wait(kq, nevents, ts);
         dbg_printf("kqops.kevent_wait returned %d", rv);
@@ -406,10 +436,21 @@ again:
         kqueue_unlock(kq);
 
         if (rv == 0) {
-            /* Timeout reached */
-            /* Avoid returning 0 when waiting indefinitely in case of spurious wakeups */
+            /*
+             * Timeout reached, or every event was dropped (a filter found nothing to report): XNU's kevent()
+             * returns 0 only when the timeout expires, so wait for what's left of it
+             */
             if (ts == NULL)
                 goto again;
+            if (deadline != 0 && ret == 0) {
+                uint64_t now = now_ns();
+                if (now < deadline) {
+                    left.tv_sec = (deadline - now) / 1000000000ull;
+                    left.tv_nsec = (deadline - now) % 1000000000ull;
+                    ts = &left;
+                    goto again;
+                }
+            }
         } else {
             dbg_printf("(%u) kevent_wait failed", myid);
             goto out;
