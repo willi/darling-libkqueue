@@ -193,6 +193,19 @@ struct kqueue {
 #endif
     RB_ENTRY(kqueue) entries;
     LIST_HEAD(knt2free, knote) kq_tofree;
+    /* On kqueue.c's kq_list from kqueue_impl() until kqueue_free(), under the global kq_mtx */
+    LIST_ENTRY(kqueue) kq_entry;
+    /*
+     * Under the global kq_mtx. The descriptors that map to this kqueue in kqmap besides kq_id: kqueue_dup() adds them,
+     * and closing one, or dup2() onto one, takes it out (kqueue_close(), kqueue_dup()). kq_ndupfds goes up only once
+     * its entry is written, and the array is replaced, never moved, so a fork's child reads only written entries
+     * (kqueue_atfork()).
+     */
+    int             *kq_dupfds;
+    volatile uint32_t kq_ndupfds;
+    uint32_t        kq_dupfds_cap;
+    /* kq_id was closed while other descriptors kept the kqueue (kqueue_close()), under the global kq_mtx */
+    int             kq_id_closed;
 };
 
 struct kqueue_vtable {
@@ -254,10 +267,10 @@ int         kevent_wait(struct kqueue *, const struct timespec *);
 int         kevent_copyout(struct kqueue *, int, struct kevent64_s *, int);
 void 		kevent_free(struct kqueue *);
 const char *kevent_dump(const struct kevent64_s *);
-struct kqueue * kqueue_lookup(int);
+struct kqueue * kqueue_lookup(int);    /* hold kq_mtx */
 int         kqueue_validate(struct kqueue *);
 void        kqueue_addref(struct kqueue *);
-void        kqueue_delref(struct kqueue *);
+void        kqueue_delref(struct kqueue *);  /* hold kq_mtx: the last reference frees the kqueue */
 // execute pending free() operations
 void kqueue_cleanup(struct kqueue* kq);
 
@@ -268,7 +281,6 @@ int         map_replace(struct map *, int, void *, void *);
 void       *map_lookup(struct map *, int);
 void       *map_delete(struct map *, int);
 void        map_free(struct map *);
-void        map_foreach(struct map *, void(*cb)(int, void*, void*), void*);
 
 void kevent_64_to_int(const struct kevent64_s* e64, struct kevent_internal_s* eint);
 void kevent_int_to_64(const struct kevent_internal_s* eint, struct kevent64_s* e64);

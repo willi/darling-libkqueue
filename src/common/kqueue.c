@@ -65,6 +65,16 @@ get_fd_limit(void)
 
 static struct map *kqmap;
 
+// Every kqueue from kqueue_impl() until kqueue_free(), under kq_mtx. A kqueue stays on it while it has a reference
+// (kqueue_delref() frees it, under kq_mtx, when the last one goes), so holding one keeps its place. kqueue_foreach()
+// and kqueue_atfork() walk this list, not kqmap: kqmap has a slot for every descriptor RLIMIT_NOFILE's hard limit
+// allows (1,048,576 in our containers), and walking all of them on every close() took most of a busy process's CPU.
+//
+// A kqueue is on the list whenever one of its descriptors maps to it in kqmap: it joins the list before its first
+// slot is set and leaves after its last slot is cleared, and kq_dupfds is written before its slot. So a fork's child,
+// which sees the parent's memory as it was at any of these steps, finds every slot it has to clear.
+static LIST_HEAD(, kqueue) kq_list = LIST_HEAD_INITIALIZER(kq_list);
+
 void
 libkqueue_init(void)
 {
@@ -123,30 +133,73 @@ void kqueue_cleanup(struct kqueue* kq)
     LIST_INIT(&kq->kq_tofree);
 }
 
-static void kqueue_free_cb(int kqfd, void* kqptr, void* private) {
-	if (kqptr == private) {
-		map_delete(kqmap, kqfd);
-	}
-};
-
-/* Must hold the kqtree_mtx when calling this */
+/* Must hold kq_mtx when calling this */
 void
 kqueue_free(struct kqueue *kq)
 {
+	uint32_t i;
+
 	kqueue_cleanup(kq);
-	// XXX: we should be doing this more efficiently (i.e. without walking through all open kqueues)
-	map_foreach(kqmap, kqueue_free_cb, kq);
+	// Its descriptors leave kqmap: kq_id and kq_dupfds, the only ones that map to it, and then it leaves the list. A
+	// slot another kqueue has taken since (kqueue_impl() replaces a stale one) stays as it is.
+	map_remove(kqmap, kq->kq_id, kq);
+	for (i = 0; i < kq->kq_ndupfds; i++)
+		map_remove(kqmap, kq->kq_dupfds[i], kq);
+	LIST_REMOVE(kq, kq_entry);
+	free(kq->kq_dupfds);
     filter_unregister_all(kq);
     kqops.kqueue_free(kq);
     free(kq);
 }
 
-struct kqueue *
-kqueue_lookup(int kq)
+// The kqueue fd maps to in kqmap, kq_id after its close() included. Must hold kq_mtx.
+static struct kqueue *
+kqueue_lookup_slot(int fd)
 {
-    return ((struct kqueue *) map_lookup(kqmap, kq));
+    return ((struct kqueue *) map_lookup(kqmap, fd));
 }
 
+// The kqueue fd is a descriptor of: not kq_id once it has been closed (it stays open, and in kqmap, while other
+// descriptors keep the kqueue; XNU's would fail with EBADF). Must hold kq_mtx.
+struct kqueue *
+kqueue_lookup(int fd)
+{
+    struct kqueue *kq = kqueue_lookup_slot(fd);
+
+    if (kq != NULL && fd == kq->kq_id && kq->kq_id_closed)
+        return (NULL);
+    return (kq);
+}
+
+// Takes fd out of kq->kq_dupfds. Must hold kq_mtx. The last entry takes its place before the count goes down, so a
+// fork's child reads every entry still in use.
+static void
+kqueue_dupfds_remove(struct kqueue *kq, int fd)
+{
+	uint32_t i;
+
+	for (i = 0; i < kq->kq_ndupfds; i++) {
+		if (kq->kq_dupfds[i] == fd) {
+			kq->kq_dupfds[i] = kq->kq_dupfds[kq->kq_ndupfds - 1];
+			atomic_dec(&kq->kq_ndupfds);
+			return;
+		}
+	}
+}
+
+// fd, a descriptor kqueue_dup() added to kq, is no longer kq's: it leaves kqmap, kq_dupfds and its reference. Must
+// hold kq_mtx.
+static void
+kqueue_drop_dup(struct kqueue *kq, int fd)
+{
+	map_remove(kqmap, fd, kq);
+	kqueue_dupfds_remove(kq, fd);
+	kqueue_delref(kq);
+}
+
+// close() of kqfd (libsystem_kernel's close.c). It returns 1 for kq_id: libkqueue closes the kqueue's own descriptor
+// with the kqueue, once its last descriptor is closed. A descriptor kqueue_dup() added is dropped here, and gets 0, so
+// that close() closes it.
 int VISIBLE
 kqueue_close(int kqfd)
 {
@@ -157,93 +210,55 @@ kqueue_close(int kqfd)
 
     pthread_mutex_lock(&kq_mtx);
 
-    struct kqueue* kq = kqueue_lookup(kqfd);
-	if (kq != NULL) {
+    struct kqueue* kq = kqueue_lookup_slot(kqfd);
+	if (kq != NULL && kqfd != kq->kq_id) {
+		kqueue_drop_dup(kq, kqfd);
+	} else if (kq != NULL) {
 		result = 1;
-		kqueue_delref(kq);
+		// kq_id stays open, and in kqmap, while other descriptors keep the kqueue. A second close() of it drops nothing.
+		if (!kq->kq_id_closed) {
+			kq->kq_id_closed = 1;
+			kqueue_delref(kq);
+		}
 	}
     pthread_mutex_unlock(&kq_mtx);
 
 	return result;
 }
 
-struct kqueue_close_context {
-	// optimization to avoid allocations in most cases
-	struct kqueue* kqs_to_check_buffer[32];
-	struct kqueue** kqs_to_check;
-	size_t buffer_size;
-	size_t kq_count;
-	bool dynamic_buffer;
-};
-
-static void kqueue_close_ref_cb(int kqfd, void* kqptr, void* private) {
-	struct kqueue* kq = kqptr;
-	struct kqueue_close_context* context = private;
-
-	if (context->kq_count >= context->buffer_size) {
-		void* new_buffer = realloc(context->dynamic_buffer ? context->kqs_to_check : NULL, sizeof(*context->kqs_to_check) * (context->buffer_size * 2));
-
-		if (!new_buffer) {
-			// well, i guess we can't check this kqueue because we don't have space in the buffer for it :/
-			return;
-		}
-
-		if (!context->dynamic_buffer) {
-			memcpy(new_buffer, context->kqs_to_check, sizeof(*context->kqs_to_check) * context->kq_count);
-		}
-
-		context->kqs_to_check = new_buffer;
-		context->dynamic_buffer = true;
-		context->buffer_size *= 2;
-	}
-
-	context->kqs_to_check[context->kq_count] = kq;
-	++context->kq_count;
-
-	kqueue_addref(kq);
-};
-
-// Calls fn(kq, arg) for every kqueue, each under its lock. kq_mtx is held only while the kqueues are collected (with a
-// reference each), since fn may take other locks.
-//
-// FIXME: this is a terrible solution. another (possible better) solution would be to keep a map that maps FDs
-//        to the kqueues they're in. then, each FD would hold a reference on the kqueues they're in and we can
-//        just access those kqueues without additional locks (only the individual kqueue lock).
+// Calls fn(kq, arg) for every live kqueue, each under its lock. kq_mtx is held only between kqueues, since fn may take
+// other locks: the walk holds a reference on the kqueue it is at, which keeps that kqueue on the list, and takes one on
+// the next before letting go of it. A kqueue created during the walk may be missed; one closed during it is visited if
+// it still has a reference when the walk reaches it. Nothing is allocated, and each kqueue is visited once, however
+// many descriptors map to it. The cost is one lock and three knote look-ups per kqueue: a process's kqueues include
+// one per workloop (kevent_id.c).
 //
 // Neither kq_mtx nor the kqueue locks block signals, so a signal handler whose close(), connect() or shutdown() comes
 // here can deadlock on a lock its own thread holds (as libsystem_kernel's sigsafe_lock.h tables can't).
 static void
 kqueue_foreach(void (*fn)(struct kqueue *, void *), void *arg)
 {
-	struct kqueue_close_context context;
-	context.kqs_to_check = context.kqs_to_check_buffer;
-	context.buffer_size = sizeof(context.kqs_to_check_buffer) / sizeof(*context.kqs_to_check_buffer);
-	context.kq_count = 0;
-	context.dynamic_buffer = false;
+	struct kqueue *kq, *next;
 
 	pthread_mutex_lock(&kq_mtx);
-	map_foreach(kqmap, kqueue_close_ref_cb, &context);
-	pthread_mutex_unlock(&kq_mtx);
-
-	for (size_t i = 0; i < context.kq_count; ++i) {
-		struct kqueue* kq = context.kqs_to_check[i];
+	kq = LIST_FIRST(&kq_list);
+	if (kq != NULL)
+		kqueue_addref(kq);
+	while (kq != NULL) {
+		pthread_mutex_unlock(&kq_mtx);
 
 		kqueue_lock(kq);
 		fn(kq, arg);
 		kqueue_unlock(kq);
-	}
 
-	// now release the references we added
-	pthread_mutex_lock(&kq_mtx);
-	for (size_t i = 0; i < context.kq_count; ++i) {
-		kqueue_delref(context.kqs_to_check[i]);
+		pthread_mutex_lock(&kq_mtx);
+		next = LIST_NEXT(kq, kq_entry);
+		if (next != NULL)
+			kqueue_addref(next);
+		kqueue_delref(kq);
+		kq = next;
 	}
 	pthread_mutex_unlock(&kq_mtx);
-
-	// and free the buffer (if we created one)
-	if (context.dynamic_buffer) {
-		free(context.kqs_to_check);
-	}
 }
 
 static void
@@ -257,9 +272,8 @@ kqueue_closed_fd_cb(struct kqueue *kq, void *arg)
 	kevent_copyin_one(kq, &ev[2]);
 }
 
-// this function is too expensive for how often it can be called (which is every time an FD is closed).
-// if possible, this should be optimized or, better yet, we should just completely refactor libkqueue so that
-// some of the things this function needs to do are no longer necessary (like walking through every single kqueue).
+// Called on every close() of a descriptor that isn't kq_id (close.c), and for the descriptor dup2() replaces (dup2.c),
+// so it costs one walk over the live kqueues (kqueue_foreach()), whatever RLIMIT_NOFILE is.
 void VISIBLE
 kqueue_closed_fd(int fd)
 {
@@ -280,9 +294,8 @@ kqueue_closed_fd(int fd)
 	ev[2].flags = EV_DELETE | EV_RECEIPT;
 	ev[2].filter = EVFILT_SOCK;
 
-	// we know it's not a kqueue FD (since kqueue_close() takes care of those),
-	// but it could be a fd inside a kqueue. Since we're creating duplicates of all fd's,
-	// we now have to walk through all known kqueues and remove the fd from them.
+	// it isn't a kqueue's kq_id (kqueue_close() keeps those), but it could be a fd inside a kqueue. Since we're
+	// creating duplicates of all fd's, we now have to walk through all known kqueues and remove the fd from them.
 	kqueue_foreach(kqueue_closed_fd_cb, ev);
 
 #ifdef DARLING
@@ -320,6 +333,36 @@ kqueue_socket_changed(int fd)
 	errno = saved_errno;
 }
 
+// Adds fd to kq->kq_dupfds. Must hold kq_mtx. A full array is replaced by a bigger copy, and the old one is freed only
+// once the new one is in place; the count goes up only once the entry is written. So a fork's child, whatever moment of
+// this it sees, reads only entries that were written (kqueue_atfork()).
+static int
+kqueue_dupfds_add(struct kqueue *kq, int fd)
+{
+    if (kq->kq_ndupfds == kq->kq_dupfds_cap) {
+        uint32_t cap = kq->kq_dupfds_cap ? kq->kq_dupfds_cap * 2 : 4;
+        int *fds = malloc(cap * sizeof(*fds));
+        int *old = kq->kq_dupfds;
+
+        if (fds == NULL)
+            return (-1);
+        if (old != NULL)
+            memcpy(fds, old, kq->kq_ndupfds * sizeof(*fds));
+        kq->kq_dupfds = fds;
+        kq->kq_dupfds_cap = cap;
+        // the new array in place before the old one goes, for a fork's child on another CPU
+#ifdef _WIN32
+        MemoryBarrier();
+#else
+        __sync_synchronize();
+#endif
+        free(old);
+    }
+    kq->kq_dupfds[kq->kq_ndupfds] = fd;
+    atomic_inc(&kq->kq_ndupfds);
+    return (0);
+}
+
 // FIXME: this can race with someone closing the old FD right after it's dup'ed but before we're informed.
 //        we should add a reference on the old FD before trying to dup it, then dup it, and then assign the reference
 //        to the new FD if the dup succeeded or delete the reference if the dup failed.
@@ -332,11 +375,40 @@ kqueue_dup(int oldfd, int newfd)
     pthread_mutex_lock(&kq_mtx);
 
     struct kqueue* kq = kqueue_lookup(oldfd);
-    if (kq != NULL)
+    // oldfd's slot even when it is a closed kq_id, which kqueue_lookup() hides: dup2() of that onto one of its
+    // kqueue's dups made newfd a copy of the same epoll file, so newfd stays the kqueue's
+    struct kqueue* from = kqueue_lookup_slot(oldfd);
+    struct kqueue* cur = kqueue_lookup_slot(newfd);
+    if (cur != NULL && cur != from && newfd != cur->kq_id)
     {
-        kqueue_addref(kq);
-        map_insert(kqmap, newfd, kq);
+        // dup2() replaced another kqueue's dup, or a dup of this one onto which a descriptor that isn't this kqueue's
+        // was duplicated: dup2() closed it without telling libkqueue (dup2.c calls only kqueue_closed_fd()). Never
+        // cur == from: dup2() of a kqueue's last descriptor onto itself would free the kqueue here.
+        kqueue_drop_dup(cur, newfd);
+        cur = NULL;
     }
+    if (kq != NULL && cur == NULL)
+    {
+        // newfd maps to the kqueue, with a reference of its own, only once it is in kq_dupfds, for kqueue_free() and
+        // kqueue_atfork()
+        if (kqueue_dupfds_add(kq, newfd) < 0)
+            dbg_puts("kqueue_dup: out of memory: the new descriptor is not the kqueue's");
+        else if (map_insert(kqmap, newfd, kq) == 0)
+            kqueue_addref(kq);
+        else
+            kqueue_dupfds_remove(kq, newfd);
+    }
+    else if (kq != NULL && cur == kq && newfd == kq->kq_id && kq->kq_id_closed && oldfd != newfd)
+    {
+        // dup2() of another of its descriptors onto kq_id after its close() (which left it open, kqueue_close()): it
+        // is the kqueue's again
+        kq->kq_id_closed = 0;
+        kqueue_addref(kq);
+    }
+    // Otherwise newfd already maps to kq: dup2() of a descriptor onto itself or onto another of kq's, which dup2()
+    // closed and replaced, so the reference stays. FIXME: or newfd is a kqueue's kq_id, and dup2() replaced that
+    // kqueue's own epoll descriptor (which the kqueue still uses) with another file. If that file is another kqueue's
+    // descriptor, this kqueue then waits on that one's epoll and reads its knotes without its lock.
 
     pthread_mutex_unlock(&kq_mtx);
 
@@ -346,22 +418,33 @@ kqueue_dup(int oldfd, int newfd)
 #endif
 }
 
-static void _kqueue_close_atfork_cb(int kqfd, void* kqptr, void* private)
+// Closes fd in a fork's child if it maps to kq. A slot another kqueue has taken since is that kqueue's to close.
+static void _kqueue_close_atfork(int fd, struct kqueue *kq)
 {
-    // A fork's child doesn't inherit kqueues. Their objects are leaked rather than freed: the child calls this
-    // before malloc is usable again (Darling's libsystem_kernel calls it from fork() itself), so this must not
-    // allocate or free memory. The descriptors their knotes use are close-on-exec.
-    (void) __close_for_kqueue(kqfd);
-    map_delete(kqmap, kqfd);
+    if (map_remove(kqmap, fd, kq) == 0)
+        (void) __close_for_kqueue(fd);
 }
 
 void VISIBLE kqueue_atfork(void)
 {
+    struct kqueue *kq;
+    uint32_t i;
+
     if (kqmap != NULL)
     {
         // Mutexes are not valid after a fork, reset it to unlocked state
         pthread_mutex_init(&kq_mtx, NULL);
-        map_foreach(kqmap, _kqueue_close_atfork_cb, NULL);
+        // A fork's child doesn't inherit kqueues: their descriptors are closed and leave kqmap. Every slot that maps to
+        // a kqueue belongs to one on kq_list, in kq_id or kq_dupfds (see kq_list). Their objects are leaked rather than
+        // freed: the child calls this before malloc is usable again (Darling's libsystem_kernel calls it from fork()
+        // itself), so this must not allocate or free memory. The descriptors their knotes use are close-on-exec.
+        LIST_FOREACH(kq, &kq_list, kq_entry)
+        {
+            _kqueue_close_atfork(kq->kq_id, kq);
+            for (i = 0; i < kq->kq_ndupfds; i++)
+                _kqueue_close_atfork(kq->kq_dupfds[i], kq);
+        }
+        LIST_INIT(&kq_list);
     }
 }
 
@@ -370,6 +453,7 @@ void kqueue_addref(struct kqueue *kq)
 	atomic_inc(&kq->kq_ref);
 }
 
+// Must hold kq_mtx: the last reference's kqueue_free() takes the kqueue off kq_list.
 void kqueue_delref(struct kqueue *kq)
 {
 	if (!atomic_dec(&kq->kq_ref)) {
@@ -415,10 +499,14 @@ kqueue_impl(void)
     pthread_mutex_lock(&kq_mtx);
     tmp = map_delete(kqmap, kq->kq_id);
     if (tmp != NULL) {
+        // The slot was stale: its kqueue stays allocated, and on kq_list, for good.
         dbg_puts("FIXME -- memory leak here");
         // TODO: kqops.kqueue_free(tmp), or (better yet) decrease it's refcount
     }
+    // on kq_list before its slot is set (see kq_list)
+    LIST_INSERT_HEAD(&kq_list, kq, kq_entry);
     if (map_insert(kqmap, kq->kq_id, kq) < 0) {
+        LIST_REMOVE(kq, kq_entry);
         pthread_mutex_unlock(&kq_mtx);
 
         dbg_puts("map insertion failed");
