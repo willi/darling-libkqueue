@@ -34,6 +34,13 @@
 
 #include "private.h"
 
+// What darlingserver receives a message into when the knote has no buffer of its own (ext[1] is 0, as libdispatch's
+// direct receives have): XNU receives into the kevent's data_out area (WQ_KEVENT_DATA_SIZE, 32 KiB for a whole batch).
+// A message that doesn't fit stays queued and comes back as MACH_RCV_TOO_LARGE with its size, and the caller
+// receives it with mach_msg(), one more darlingserver round trip; with the 64 bytes this used to pass, that was nearly
+// every message (a firehose push with its audit trailer is 92). One page fits the usual MIG and firehose messages.
+#define MACHPORT_RCV_BUF_SIZE 4096
+
 int
 evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
 {
@@ -68,8 +75,12 @@ evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
 	call.header.number = dserver_kqchan_msgnum_mach_port_read;
 	call.header.pid = getpid();
 	call.header.tid = THREAD_ID;
-	call.default_buffer = (uint64_t)&src->kn_extra_buffer[0];
-	call.default_buffer_size = sizeof(src->kn_extra_buffer);
+	// the knote's buffer is only reused once libdispatch has taken the message: a direct receive is EV_DISPATCH, so the
+	// knote reports nothing until it is re-enabled after its handler copied the message (dispatch_mach_msg_create())
+	if (src->kn_rcv_buf == NULL)
+		src->kn_rcv_buf = malloc(MACHPORT_RCV_BUF_SIZE);
+	call.default_buffer = (uint64_t)(src->kn_rcv_buf ? src->kn_rcv_buf : &src->kn_extra_buffer[0]);
+	call.default_buffer_size = src->kn_rcv_buf ? MACHPORT_RCV_BUF_SIZE : sizeof(src->kn_extra_buffer);
 	rv = send(src->kdata.kn_dupfd, &call, sizeof(call), 0);
 	if (rv < 0) {
 		dbg_printf("evfilt_machport_copyout() sending request failed: %d (%s)", errno, strerror(errno));
@@ -108,8 +119,7 @@ evfilt_machport_copyout(struct kevent64_s *dst, struct knote *src, void *ptr)
 	dst->ext[1] = reply.kev.ext[1];
 	dst->fflags = reply.kev.fflags;
 
-	// TODO: we need to properly support kevent_qos with regards to the data_out argument;
-	//       this is what's supposed to be passed in as the default buffer, not a buffer of our own.
+	// TODO: kevent_qos()'s data_out is what XNU receives into; the knote's own buffer stands in for it.
 
     return (0);
 }

@@ -70,8 +70,11 @@ extern long int syscall (long int __sysno, ...);
 #define KNOTE_PLATFORM_SPECIFIC \
     int kn_epollfd; /* A copy of filter->epfd */      \
     union { \
-        char kn_extra_buffer[64]; /* Extra data buffer used by some filters (EVFILT_MACHPORT) */ \
+        char kn_extra_buffer[64]; /* Extra data buffer used by some filters (EVFILT_SOCKET) */ \
     }; \
+    /* EVFILT_MACHPORT: where darlingserver receives a message for the knote (MACHPORT_RCV_BUF_SIZE bytes, made on \
+       its first event), as XNU's data_out area; freed with the knote */ \
+    void *kn_rcv_buf; \
     union { \
         int kn_timerfd; \
         int kn_signalfd; \
@@ -79,6 +82,9 @@ extern long int syscall (long int __sysno, ...);
         int kn_eventfd; \
         int kn_dupfd; \
     } kdata
+
+/* frees what a knote's platform-specific members hold, when the knote itself is freed */
+#define KNOTE_PLATFORM_FREE(kn) free((kn)->kn_rcv_buf)
 
 /*
  * Additional members of struct kqueue

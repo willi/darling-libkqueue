@@ -118,6 +118,9 @@ void kqueue_cleanup(struct kqueue* kq)
     for (next = kq->kq_tofree.lh_first; next != NULL; next = tmp)
     {
         tmp = next->kn_entries2free.le_next;
+#ifdef KNOTE_PLATFORM_FREE
+        KNOTE_PLATFORM_FREE(next);
+#endif
         free(next);
     }
     LIST_INIT(&kq->kq_tofree);
