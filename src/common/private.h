@@ -266,10 +266,10 @@ int         kevent_wait(struct kqueue *, const struct timespec *);
 int         kevent_copyout(struct kqueue *, int, struct kevent64_s *, int);
 void 		kevent_free(struct kqueue *);
 const char *kevent_dump(const struct kevent64_s *);
-struct kqueue * kqueue_lookup(int);
+struct kqueue * kqueue_lookup(int);    /* hold kq_mtx */
 int         kqueue_validate(struct kqueue *);
 void        kqueue_addref(struct kqueue *);
-void        kqueue_delref(struct kqueue *);
+void        kqueue_delref(struct kqueue *);  /* hold kq_mtx: the last reference frees the kqueue */
 // execute pending free() operations
 void kqueue_cleanup(struct kqueue* kq);
 

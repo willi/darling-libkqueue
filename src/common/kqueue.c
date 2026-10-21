@@ -152,10 +152,23 @@ kqueue_free(struct kqueue *kq)
     free(kq);
 }
 
-struct kqueue *
-kqueue_lookup(int kq)
+// The kqueue fd maps to in kqmap, kq_id after its close() included. Must hold kq_mtx.
+static struct kqueue *
+kqueue_lookup_slot(int fd)
 {
-    return ((struct kqueue *) map_lookup(kqmap, kq));
+    return ((struct kqueue *) map_lookup(kqmap, fd));
+}
+
+// The kqueue fd is a descriptor of: not kq_id once it has been closed (it stays open, and in kqmap, while other
+// descriptors keep the kqueue; XNU's would fail with EBADF). Must hold kq_mtx.
+struct kqueue *
+kqueue_lookup(int fd)
+{
+    struct kqueue *kq = kqueue_lookup_slot(fd);
+
+    if (kq != NULL && fd == kq->kq_id && kq->kq_id_closed)
+        return (NULL);
+    return (kq);
 }
 
 // Takes fd out of kq->kq_dupfds. Must hold kq_mtx. The last entry takes its place before the count goes down, so a
@@ -174,9 +187,19 @@ kqueue_dupfds_remove(struct kqueue *kq, int fd)
 	}
 }
 
+// fd, a descriptor kqueue_dup() added to kq, is no longer kq's: it leaves kqmap, kq_dupfds and its reference. Must
+// hold kq_mtx.
+static void
+kqueue_drop_dup(struct kqueue *kq, int fd)
+{
+	map_remove(kqmap, fd, kq);
+	kqueue_dupfds_remove(kq, fd);
+	kqueue_delref(kq);
+}
+
 // close() of kqfd (libsystem_kernel's close.c). It returns 1 for kq_id: libkqueue closes the kqueue's own descriptor
-// with the kqueue, once its last descriptor is closed. A descriptor kqueue_dup() added leaves kqmap and the kqueue
-// here, and gets 0, so that close() closes it.
+// with the kqueue, once its last descriptor is closed. A descriptor kqueue_dup() added is dropped here, and gets 0, so
+// that close() closes it.
 int VISIBLE
 kqueue_close(int kqfd)
 {
@@ -187,11 +210,9 @@ kqueue_close(int kqfd)
 
     pthread_mutex_lock(&kq_mtx);
 
-    struct kqueue* kq = kqueue_lookup(kqfd);
+    struct kqueue* kq = kqueue_lookup_slot(kqfd);
 	if (kq != NULL && kqfd != kq->kq_id) {
-		map_remove(kqmap, kqfd, kq);
-		kqueue_dupfds_remove(kq, kqfd);
-		kqueue_delref(kq);
+		kqueue_drop_dup(kq, kqfd);
 	} else if (kq != NULL) {
 		result = 1;
 		// kq_id stays open, and in kqmap, while other descriptors keep the kqueue. A second close() of it drops nothing.
@@ -273,9 +294,8 @@ kqueue_closed_fd(int fd)
 	ev[2].flags = EV_DELETE | EV_RECEIPT;
 	ev[2].filter = EVFILT_SOCK;
 
-	// we know it's not a kqueue FD (since kqueue_close() takes care of those),
-	// but it could be a fd inside a kqueue. Since we're creating duplicates of all fd's,
-	// we now have to walk through all known kqueues and remove the fd from them.
+	// it isn't a kqueue's kq_id (kqueue_close() keeps those), but it could be a fd inside a kqueue. Since we're
+	// creating duplicates of all fd's, we now have to walk through all known kqueues and remove the fd from them.
 	kqueue_foreach(kqueue_closed_fd_cb, ev);
 
 #ifdef DARLING
@@ -330,6 +350,12 @@ kqueue_dupfds_add(struct kqueue *kq, int fd)
             memcpy(fds, old, kq->kq_ndupfds * sizeof(*fds));
         kq->kq_dupfds = fds;
         kq->kq_dupfds_cap = cap;
+        // the new array in place before the old one goes, for a fork's child on another CPU
+#ifdef _WIN32
+        MemoryBarrier();
+#else
+        __sync_synchronize();
+#endif
         free(old);
     }
     kq->kq_dupfds[kq->kq_ndupfds] = fd;
@@ -349,7 +375,14 @@ kqueue_dup(int oldfd, int newfd)
     pthread_mutex_lock(&kq_mtx);
 
     struct kqueue* kq = kqueue_lookup(oldfd);
-    struct kqueue* cur = kqueue_lookup(newfd);
+    struct kqueue* cur = kqueue_lookup_slot(newfd);
+    if (cur != NULL && cur != kq && newfd != cur->kq_id)
+    {
+        // dup2() replaced another kqueue's dup, or a dup of this one onto which a descriptor that isn't this kqueue's
+        // was duplicated: dup2() closed it without telling libkqueue (dup2.c calls only kqueue_closed_fd())
+        kqueue_drop_dup(cur, newfd);
+        cur = NULL;
+    }
     if (kq != NULL && cur == NULL)
     {
         // newfd maps to the kqueue, with a reference of its own, only once it is in kq_dupfds, for kqueue_free() and
@@ -361,16 +394,16 @@ kqueue_dup(int oldfd, int newfd)
         else
             kqueue_dupfds_remove(kq, newfd);
     }
-    else if (kq != NULL && cur == kq && newfd == kq->kq_id && kq->kq_id_closed)
+    else if (kq != NULL && cur == kq && newfd == kq->kq_id && kq->kq_id_closed && oldfd != newfd)
     {
-        // dup2() onto kq_id after its close() (which left it open, kqueue_close()): it is the kqueue's again
+        // dup2() of another of its descriptors onto kq_id after its close() (which left it open, kqueue_close()): it
+        // is the kqueue's again
         kq->kq_id_closed = 0;
         kqueue_addref(kq);
     }
-    // Otherwise newfd already maps to a kqueue. If it is kq, that is dup2() of a descriptor onto itself or onto another
-    // of kq's: dup2() closed and replaced it, and the reference stays. FIXME: if it is another kqueue's, dup2() closed
-    // that kqueue's descriptor without telling libkqueue (dup2.c calls only kqueue_closed_fd()), so newfd still maps
-    // to it.
+    // Otherwise newfd already maps to kq: dup2() of a descriptor onto itself or onto another of kq's, which dup2()
+    // closed and replaced, so the reference stays. FIXME: or newfd is a kqueue's kq_id, and dup2() replaced that
+    // kqueue's own epoll descriptor (which the kqueue still uses) with another file.
 
     pthread_mutex_unlock(&kq_mtx);
 
