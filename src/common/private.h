@@ -193,11 +193,18 @@ struct kqueue {
 #endif
     RB_ENTRY(kqueue) entries;
     LIST_HEAD(knt2free, knote) kq_tofree;
-    /* On kqueue.c's list of live kqueues from kqueue_impl() until kqueue_free(), under the global kq_mtx */
-    LIST_ENTRY(kqueue) kq_live;
-    /* The descriptors kqueue_dup() mapped to this kqueue besides kq_id, under the global kq_mtx */
+    /* On kqueue.c's kq_list from kqueue_impl() until kqueue_free(), under the global kq_mtx */
+    LIST_ENTRY(kqueue) kq_entry;
+    /*
+     * Under the global kq_mtx. The descriptors that map to this kqueue in kqmap besides kq_id: kqueue_dup() adds them,
+     * and closing one takes it out (kqueue_close()). kq_ndupfds goes up only once its entry is written, and the array
+     * is replaced, never moved, so a fork's child reads only written entries (kqueue_atfork()).
+     */
     int             *kq_dupfds;
-    unsigned int    kq_ndupfds, kq_dupfds_cap;
+    volatile uint32_t kq_ndupfds;
+    uint32_t        kq_dupfds_cap;
+    /* kq_id was closed while other descriptors kept the kqueue (kqueue_close()), under the global kq_mtx */
+    int             kq_id_closed;
 };
 
 struct kqueue_vtable {
@@ -273,7 +280,6 @@ int         map_replace(struct map *, int, void *, void *);
 void       *map_lookup(struct map *, int);
 void       *map_delete(struct map *, int);
 void        map_free(struct map *);
-void        map_foreach(struct map *, void(*cb)(int, void*, void*), void*);
 
 void kevent_64_to_int(const struct kevent64_s* e64, struct kevent_internal_s* eint);
 void kevent_int_to_64(const struct kevent_internal_s* eint, struct kevent64_s* e64);
