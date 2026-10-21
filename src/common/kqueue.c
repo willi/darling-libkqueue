@@ -375,11 +375,15 @@ kqueue_dup(int oldfd, int newfd)
     pthread_mutex_lock(&kq_mtx);
 
     struct kqueue* kq = kqueue_lookup(oldfd);
+    // oldfd's slot even when it is a closed kq_id, which kqueue_lookup() hides: dup2() of that onto one of its
+    // kqueue's dups made newfd a copy of the same epoll file, so newfd stays the kqueue's
+    struct kqueue* from = kqueue_lookup_slot(oldfd);
     struct kqueue* cur = kqueue_lookup_slot(newfd);
-    if (cur != NULL && cur != kq && newfd != cur->kq_id)
+    if (cur != NULL && cur != from && newfd != cur->kq_id)
     {
         // dup2() replaced another kqueue's dup, or a dup of this one onto which a descriptor that isn't this kqueue's
-        // was duplicated: dup2() closed it without telling libkqueue (dup2.c calls only kqueue_closed_fd())
+        // was duplicated: dup2() closed it without telling libkqueue (dup2.c calls only kqueue_closed_fd()). Never
+        // cur == from: dup2() of a kqueue's last descriptor onto itself would free the kqueue here.
         kqueue_drop_dup(cur, newfd);
         cur = NULL;
     }
@@ -403,7 +407,8 @@ kqueue_dup(int oldfd, int newfd)
     }
     // Otherwise newfd already maps to kq: dup2() of a descriptor onto itself or onto another of kq's, which dup2()
     // closed and replaced, so the reference stays. FIXME: or newfd is a kqueue's kq_id, and dup2() replaced that
-    // kqueue's own epoll descriptor (which the kqueue still uses) with another file.
+    // kqueue's own epoll descriptor (which the kqueue still uses) with another file. If that file is another kqueue's
+    // descriptor, this kqueue then waits on that one's epoll and reads its knotes without its lock.
 
     pthread_mutex_unlock(&kq_mtx);
 

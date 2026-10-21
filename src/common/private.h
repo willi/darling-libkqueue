@@ -197,8 +197,9 @@ struct kqueue {
     LIST_ENTRY(kqueue) kq_entry;
     /*
      * Under the global kq_mtx. The descriptors that map to this kqueue in kqmap besides kq_id: kqueue_dup() adds them,
-     * and closing one takes it out (kqueue_close()). kq_ndupfds goes up only once its entry is written, and the array
-     * is replaced, never moved, so a fork's child reads only written entries (kqueue_atfork()).
+     * and closing one, or dup2() onto one, takes it out (kqueue_close(), kqueue_dup()). kq_ndupfds goes up only once
+     * its entry is written, and the array is replaced, never moved, so a fork's child reads only written entries
+     * (kqueue_atfork()).
      */
     int             *kq_dupfds;
     volatile uint32_t kq_ndupfds;
