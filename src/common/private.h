@@ -193,6 +193,11 @@ struct kqueue {
 #endif
     RB_ENTRY(kqueue) entries;
     LIST_HEAD(knt2free, knote) kq_tofree;
+    /* On kqueue.c's list of live kqueues from kqueue_impl() until kqueue_free(), under the global kq_mtx */
+    LIST_ENTRY(kqueue) kq_live;
+    /* The descriptors kqueue_dup() mapped to this kqueue besides kq_id, under the global kq_mtx */
+    int             *kq_dupfds;
+    unsigned int    kq_ndupfds, kq_dupfds_cap;
 };
 
 struct kqueue_vtable {
