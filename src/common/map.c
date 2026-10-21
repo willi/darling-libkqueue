@@ -74,7 +74,8 @@ map_remove(struct map *m, int idx, void *ptr)
     if (slowpath(idx < 0 || idx > (int)m->len))
            return (-1);
 
-    if (atomic_ptr_cas(&(m->data[idx]), ptr, 0) == NULL) {
+    // atomic_ptr_cas() returns the value it found: ptr if it removed it
+    if (atomic_ptr_cas(&(m->data[idx]), ptr, 0) == ptr) {
         dbg_printf("removed %p from location %d", ptr, idx);
         return (0);
     } else {
